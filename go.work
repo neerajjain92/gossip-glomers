@@ -1,0 +1,8 @@
+go 1.21.5
+
+use (
+./01-echo/maelstrom-echo
+./02-unique-id-generation
+./03-single-node-broadcast
+./04-multi-node-broadcast
+)
