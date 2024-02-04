@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"reflect"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"golang.org/x/exp/maps"
@@ -27,11 +28,26 @@ func DeepCloneMap(originalMap map[string]interface{}) map[string]interface{} {
 	return clonedMap
 }
 
+// Global variable declaration
+var ticker *time.Ticker
+
 func main() {
-	log.Println("Inside MultiNode Brodcast Main")
+	log.Println("Inside Fault Tolerant MultiNode Brodcast Main")
+	ticker = time.NewTicker(5 * time.Second)
 	n := maelstrom.NewNode()
 	messagesMap := make(map[interface{}]interface{})
+	messagesTillNow := []float64{}
 	peers := make(map[interface{}]interface{})
+
+	// We should also maintain a map that for every peer, how much we have already peer-copied to them
+	peersCheckPoint := make(map[interface{}]int)
+
+	go func() {
+		for t := range ticker.C {
+			log.Printf("Initiating PeerCopy at %v \n", t)
+			initiatePeerCopy(peers, n, peersCheckPoint, messagesTillNow)
+		}
+	}()
 
 	// Register the broadcast handler
 	/**
@@ -51,10 +67,10 @@ func main() {
 		log.Printf("Received Broadcast on %s and the message %v \n", n.ID(), body)
 
 		// Persist the data
-		addIfNotPresent(messagesMap, body["message"].(float64))
-
-		// Do the peerCopy
-		go initiatePeerCopy(DeepCloneMap(body), peers, n)
+		isAdded := addIfNotPresent(messagesMap, body["message"].(float64))
+		if isAdded {
+			messagesTillNow = append(messagesTillNow, body["message"].(float64))
+		}
 
 		// Do the cleanup
 		body["type"] = "broadcast_ok"
@@ -69,8 +85,10 @@ func main() {
 			return err
 		}
 
-		log.Printf("Received peerCopy message on %s from %s", msg.Dest, msg.Src)
-		addIfNotPresent(messagesMap, body["message"].(float64))
+		log.Printf("Received peerCopy message %v on %s from %s", body, msg.Dest, msg.Src)
+		for _, message := range body["message"].([]interface{}) {
+			addIfNotPresent(messagesMap, message.(float64))
+		}
 
 		body["type"] = "peerCopyOk"
 		return n.Reply(msg, body)
@@ -151,20 +169,55 @@ func main() {
 	}
 }
 
-func addIfNotPresent(messagesMap map[interface{}]interface{}, message interface{}) {
+func addIfNotPresent(messagesMap map[interface{}]interface{}, message interface{}) bool {
 	var exists struct{}
 	if _, found := messagesMap[message]; !found {
 		messagesMap[message] = exists
+		return true
 	}
+	return false
 }
 
-func initiatePeerCopy(body map[string]any, peers map[interface{}]interface{}, n *maelstrom.Node) {
+func initiatePeerCopy(peers map[interface{}]interface{}, n *maelstrom.Node,
+	peersCheckPoint map[interface{}]int, messagesTillNow []float64) {
+
 	peerCopyMessage := map[string]interface{}{
 		"type":    "peerCopy",
-		"message": body["message"],
-		"msg_id":  body["msg_id"],
+		"message": []float64{},
 	}
+	log.Printf("PeersCheckPoint :==> %v \n", peersCheckPoint)
 	for _, peer := range maps.Keys(peers) {
-		n.Send(peer.(string), peerCopyMessage)
+		log.Printf("Sending PeerCopy to %v", peer)
+
+		// Find the difference between last checkPoint and current length
+		if _, found := peersCheckPoint[peer]; found {
+			if (len(messagesTillNow) - int(peersCheckPoint[peer])) > 0 {
+				// Take the sub-slice and send to peer
+				peerCopyMessage["message"] = messagesTillNow[int(peersCheckPoint[peer]):]
+				log.Printf("This peer is lagging behind sending, remaining messsages in one shot, peer: %d; payload: %v \n", peer, peerCopyMessage)
+
+				err := n.RPC(peer.(string), peerCopyMessage, func(msg maelstrom.Message) error {
+					var body map[string]any
+
+					if err := json.Unmarshal(msg.Body, &body); err != nil {
+						return err
+					}
+					log.Printf("Received Response of PeerCopy from peer %s; resp=%v", peer, body)
+					_, ok := peersCheckPoint[peer]
+					if ok {
+						peersCheckPoint[peer] = len(messagesTillNow)
+					} else {
+						peersCheckPoint[peer] = 0
+					}
+					return nil
+				})
+				if err != nil {
+					log.Printf("Error while sending RPC to peer %s and err=%v \n", peer, err)
+				}
+			}
+		} else {
+			log.Printf("Peers Checkpoint not found for peer: %d \n", peer)
+			peersCheckPoint[peer] = 0
+		}
 	}
 }

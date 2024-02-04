@@ -5,4 +5,5 @@ use (
 ./02-unique-id-generation
 ./03-single-node-broadcast
 ./04-multi-node-broadcast
+./05-fault-tolerant-multi-node-broadcast
 )
