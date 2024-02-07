@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"reflect"
+	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -30,17 +30,18 @@ func DeepCloneMap(originalMap map[string]interface{}) map[string]interface{} {
 
 // Global variable declaration
 var ticker *time.Ticker
+var mu sync.Mutex
 
 func main() {
 	log.Println("Inside Fault Tolerant MultiNode Brodcast Main")
-	ticker = time.NewTicker(5 * time.Second)
+	ticker = time.NewTicker(400 * time.Millisecond)
 	n := maelstrom.NewNode()
 	messagesMap := make(map[interface{}]interface{})
 	messagesTillNow := []float64{}
 	peers := make(map[interface{}]interface{})
 
 	// We should also maintain a map that for every peer, how much we have already peer-copied to them
-	peersCheckPoint := make(map[interface{}]int)
+	peersCheckPoint := make(map[interface{}]map[interface{}]interface{})
 
 	go func() {
 		for t := range ticker.C {
@@ -67,9 +68,13 @@ func main() {
 		log.Printf("Received Broadcast on %s and the message %v \n", n.ID(), body)
 
 		// Persist the data
+		mu.Lock()
 		isAdded := addIfNotPresent(messagesMap, body["message"].(float64))
+		mu.Unlock()
 		if isAdded {
+			mu.Lock()
 			messagesTillNow = append(messagesTillNow, body["message"].(float64))
+			mu.Unlock()
 		}
 
 		// Do the cleanup
@@ -87,7 +92,16 @@ func main() {
 
 		log.Printf("Received peerCopy message %v on %s from %s", body, msg.Dest, msg.Src)
 		for _, message := range body["message"].([]interface{}) {
-			addIfNotPresent(messagesMap, message.(float64))
+			mu.Lock()
+			isAdded := addIfNotPresent(messagesMap, message.(float64))
+			mu.Unlock()
+			if isAdded {
+				mu.Lock()
+				messagesTillNow = append(messagesTillNow, message.(float64))
+				mu.Unlock()
+			} else {
+				log.Printf("Skipping message %d from peerCopy", message)
+			}
 		}
 
 		body["type"] = "peerCopyOk"
@@ -116,7 +130,7 @@ func main() {
 		}
 
 		body["type"] = "read_ok"
-		body["messages"] = maps.Keys(messagesMap)
+		body["messages"] = messagesTillNow
 
 		return n.Reply(msg, body)
 	})
@@ -137,30 +151,28 @@ func main() {
 		topology := body["topology"].(map[string]interface{})
 
 		log.Println("Actual Topology :==> ", topology)
-		log.Printf("And the type of specific value is %v", reflect.TypeOf(topology[n.ID()]))
 
-		// Iterate over topology Interface
-		for _, connectionsInterface := range topology {
-			// Type assertion for connections
-			connections, ok := connectionsInterface.([]interface{})
+		// Iterate over topology Interface, for this Node
+		for _, connection := range topology[n.ID()].([]interface{}) {
+			connectionStr, ok := connection.(string)
 			if !ok {
-				log.Fatal("Tpe assertion Failed for Connections interface")
+				log.Fatal("Type assertion failed for connection ")
 				panic(nil)
 			}
-			for _, connection := range connections {
-				connectionStr, ok := connection.(string)
-				if !ok {
-					log.Fatal("Type assertion failed for connection ")
-					panic(nil)
-				}
-				if connectionStr != n.ID() {
-					addIfNotPresent(peers, connectionStr)
-				}
+			if connectionStr != n.ID() {
+				mu.Lock()
+				addIfNotPresent(peers, connectionStr)
+				mu.Unlock()
 			}
 		}
 
 		delete(body, "topology")
-		log.Printf("Complete Toplogy of %s is %v", n.ID(), peers)
+		log.Printf("Toplogy of %s is %v", n.ID(), peers)
+
+		// Set the checkpoint for all peers
+		for _, peer := range peers {
+			peersCheckPoint[peer] = make(map[interface{}]interface{})
+		}
 		return n.Reply(msg, body)
 	})
 
@@ -179,8 +191,7 @@ func addIfNotPresent(messagesMap map[interface{}]interface{}, message interface{
 }
 
 func initiatePeerCopy(peers map[interface{}]interface{}, n *maelstrom.Node,
-	peersCheckPoint map[interface{}]int, messagesTillNow []float64) {
-
+	peersCheckPoint map[interface{}]map[interface{}]interface{}, messagesTillNow []float64) {
 	peerCopyMessage := map[string]interface{}{
 		"type":    "peerCopy",
 		"message": []float64{},
@@ -190,34 +201,41 @@ func initiatePeerCopy(peers map[interface{}]interface{}, n *maelstrom.Node,
 		log.Printf("Sending PeerCopy to %v", peer)
 
 		// Find the difference between last checkPoint and current length
-		if _, found := peersCheckPoint[peer]; found {
-			if (len(messagesTillNow) - int(peersCheckPoint[peer])) > 0 {
-				// Take the sub-slice and send to peer
-				peerCopyMessage["message"] = messagesTillNow[int(peersCheckPoint[peer]):]
-				log.Printf("This peer is lagging behind sending, remaining messsages in one shot, peer: %d; payload: %v \n", peer, peerCopyMessage)
+		if (len(messagesTillNow) - len(peersCheckPoint[peer])) > 0 {
+			// Take the sub-slice and send to peer
+			peerCopyMessage["message"] = messagesTillNow[len(peersCheckPoint[peer]):]
 
-				err := n.RPC(peer.(string), peerCopyMessage, func(msg maelstrom.Message) error {
-					var body map[string]any
-
-					if err := json.Unmarshal(msg.Body, &body); err != nil {
-						return err
-					}
-					log.Printf("Received Response of PeerCopy from peer %s; resp=%v", peer, body)
-					_, ok := peersCheckPoint[peer]
-					if ok {
-						peersCheckPoint[peer] = len(messagesTillNow)
-					} else {
-						peersCheckPoint[peer] = 0
-					}
-					return nil
-				})
-				if err != nil {
-					log.Printf("Error while sending RPC to peer %s and err=%v \n", peer, err)
-				}
+			if len(peerCopyMessage["message"].([]float64)) == 0 {
+				return
 			}
-		} else {
-			log.Printf("Peers Checkpoint not found for peer: %d \n", peer)
-			peersCheckPoint[peer] = 0
+
+			log.Printf("This peer is lagging behind sending, remaining messsages in one shot, peer: %d; payload: %v \n", peer, peerCopyMessage)
+
+			err := n.RPC(peer.(string), peerCopyMessage, func(msg maelstrom.Message) error {
+				var body map[string]any
+
+				if err := json.Unmarshal(msg.Body, &body); err != nil {
+					return err
+				}
+				log.Printf("Received Response of PeerCopy from peer %s; resp=%v", msg.Src, body)
+
+				// Let's add whatever we sent till now
+				mu.Lock()
+				log.Printf("Updating PeerCheckPoint for peer:%s from %d", msg.Src, len(peersCheckPoint[msg.Src]))
+				for _, message := range body["message"].([]interface{}) {
+					if peersCheckPoint[msg.Src] == nil {
+						peersCheckPoint[msg.Src] = make(map[interface{}]interface{})
+					}
+					peersCheckPoint[msg.Src][message] = struct{}{}
+				}
+				log.Printf("Updated PeerCheckPoint for peer:%s to %d", msg.Src, len(peersCheckPoint[msg.Src]))
+				log.Printf("Final PeerCheckPoint for peer:%s  [%v]", msg.Src, peersCheckPoint[msg.Src])
+				mu.Unlock()
+				return nil
+			})
+			if err != nil {
+				log.Printf("Error while sending RPC to peer %s and err=%v \n", peer, err)
+			}
 		}
 	}
 }
