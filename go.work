@@ -6,4 +6,5 @@ use (
 ./03-single-node-broadcast
 ./04-multi-node-broadcast
 ./05-fault-tolerant-multi-node-broadcast
+./06-efficient-broadcast-#3D
 )
